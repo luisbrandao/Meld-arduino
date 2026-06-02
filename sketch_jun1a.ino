@@ -28,16 +28,19 @@ const unsigned long PID_INTERVAL = 250; // ms between PID computations
 
 // Safety / auto-cycle (manual process -- never leave it running unattended)
 const unsigned long HEATING_MAX = 300000UL; // 5 min: auto-cycle HEATING -> COOLING
-const unsigned long COOLING_MAX = 300000UL; // 5 min: auto-cycle COOLING -> IDLE
-const float TEMP_MIN_VALID = 5.0;           // below this => thermistor open/disconnected
+const unsigned long COOLING_MAX = 300000UL; // 5 min: auto-cycle COOLING -> IDLE (backstop)
+const float COOL_DONE_TEMP = 45.0;          // COOLING -> IDLE once cooled below this
+const float TEMP_MIN_VALID = -10.0;         // below this => thermistor open/disconnected
+                                            // (open reads ~-19C; -10 clears room-temp noise)
+const int   FAULT_DEBOUNCE = 3;             // consecutive bad reads before faulting
 
 // ---------- PID gains ----------
-// Derived from the trustworthy first auto-tune (Ku=60.59, Tu=17.02s) using
-// Tyreus-Luyben tuning -> stable, low-overshoot hold (gentler than Ziegler-Nichols).
-//   Kp = Ku/3.2,  Ki = Kp/(2.2*Tu),  Kd = Kp*(Tu/6.3)
+// Base from the first auto-tune (Ku=60.59, Tu=17.02s) via Tyreus-Luyben, with Ki
+// raised ~3x: the TL Ki=0.51 rebuilt holding power too slowly (~75s undershoot
+// recovery). 1.5 cuts that to ~20s; conditional anti-windup keeps overshoot in check.
 // 'p'/'i'/'d' adjust live; re-run 'a' to retune (see note on AT_BAND below).
 float Kp = 18.9;
-float Ki = 0.51;
+float Ki = 1.5;
 float Kd = 51.2;
 
 // PID internal state
@@ -63,11 +66,14 @@ char serialBuf[16];
 int  serialLen = 0;
 
 float readTemperature() {
-  int adc = analogRead(thermistorPin);
-  if (adc >= 1023) adc = 1022;
-  if (adc <= 0) adc = 1;
+  // Oversample: average 16 reads for sub-count resolution + less derivative chatter.
+  long sum = 0;
+  for (int i = 0; i < 16; i++) sum += analogRead(thermistorPin);
+  float adc = sum / 16.0;
+  if (adc >= 1023.0) adc = 1022.0;
+  if (adc <= 0.0) adc = 1.0;
 
-  float resistance = SERIES_RESISTOR * ((float)adc / (1023.0 - adc));
+  float resistance = SERIES_RESISTOR * (adc / (1023.0 - adc));
 
   float steinhart = resistance / NOMINAL_RESISTANCE;
   steinhart = log(steinhart);
@@ -114,14 +120,24 @@ int computePID(float temp, float dt) {
   float error = TARGET_TEMP - temp;
   float dTemp = havePrevTemp ? (temp - lastTemp) / dt : 0.0;
 
-  integral += error * dt;
-  // Anti-windup: clamp the integral so its contribution stays within output range.
-  if (Ki > 0.0001) {
-    float iLimit = PWM_MAX / Ki;
-    integral = constrain(integral, -iLimit, iLimit);
+  // Tentative output with the current integral.
+  float output = Kp * error + Ki * integral - Kd * dTemp;
+
+  // Conditional anti-windup: only accumulate the integral when the output is NOT
+  // saturated (or when the error pulls it back toward range). This stops the
+  // integral from winding up during the full-power heat-up -- which was the
+  // ~12 deg C overshoot. The integral only starts working near the setpoint.
+  bool atUpper = output >= PWM_MAX;
+  bool atLower = output <= 0;
+  if ((!atUpper && !atLower) || (atUpper && error < 0) || (atLower && error > 0)) {
+    integral += error * dt;
+    if (Ki > 0.0001) {                       // backstop bound
+      float iLimit = PWM_MAX / Ki;
+      integral = constrain(integral, -iLimit, iLimit);
+    }
   }
 
-  float output = Kp * error + Ki * integral - Kd * dTemp;
+  output = Kp * error + Ki * integral - Kd * dTemp;
   return (int)constrain(output, 0, PWM_MAX);
 }
 
@@ -159,25 +175,35 @@ void updateCooling() {
 //   2) Auto-cycle timeouts: HEATING -> COOLING -> IDLE after 5 min each, so the
 //      rig never sits hot unattended.
 void checkSafety(float temp) {
+  // Debounce: require several consecutive implausible reads so a single ADC glitch
+  // near the rail (room temp is close to the open-circuit value at 1k) can't trip it.
+  static int faultCount = 0;
   if (temp < TEMP_MIN_VALID) {
-    if (currentState != IDLE) {
-      Serial.println("THERMISTOR FAULT (open?) -> IDLE");
+    if (++faultCount >= FAULT_DEBOUNCE) {
+      if (currentState != IDLE) {
+        Serial.println("THERMISTOR FAULT (open?) -> IDLE");
+      }
+      allOff();
+      currentState = IDLE;
+      stateStartTime = millis();
     }
-    allOff();
-    currentState = IDLE;
-    stateStartTime = millis();
     return;
   }
+  faultCount = 0;
 
   unsigned long elapsed = millis() - stateStartTime;
   if (currentState == HEATING && elapsed > HEATING_MAX) {
     currentState = COOLING;
     stateStartTime = millis();
     Serial.println("TIMEOUT: HEATING -> COOLING");
-  } else if (currentState == COOLING && elapsed > COOLING_MAX) {
+  } else if (currentState == COOLING && (temp < COOL_DONE_TEMP || elapsed > COOLING_MAX)) {
     currentState = IDLE;
     stateStartTime = millis();
-    Serial.println("TIMEOUT: COOLING -> IDLE");
+    if (temp < COOL_DONE_TEMP) {
+      Serial.println("COOLED (<45C): COOLING -> IDLE");
+    } else {
+      Serial.println("TIMEOUT: COOLING -> IDLE");
+    }
   }
 }
 
