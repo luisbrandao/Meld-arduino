@@ -2,6 +2,8 @@
 
 Arduino-based standalone heater controller for a 3D-printer hotend (thermistor + heater cartridge).
 
+https://www.printables.com/model/745877-meld-a-filament-joiner-by-recreator3d
+
 ## Wiring
 
 ### Arduino Pin Connections

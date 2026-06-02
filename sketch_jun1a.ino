@@ -21,7 +21,7 @@ const float NOMINAL_TEMPERATURE = 25.0;
 const float BETA_COEFFICIENT    = 3950.0;
 
 // ---------- Control parameters ----------
-float TARGET_TEMP = 265.0;            // setpoint, adjustable live over serial ('s<n>')
+float TARGET_TEMP = 275.0;            // setpoint, adjustable live over serial ('s<n>')
 const float OVERTEMP_CUTOFF = 320.0;  // hard safety cutoff
 const int   PWM_MAX = 255;
 const unsigned long PID_INTERVAL = 250; // ms between PID computations
