@@ -15,7 +15,7 @@ const int fanPin        = 12;   // cooling fan MOSFET
 const int buttonPin     = 7;    // momentary button to GND (INPUT_PULLUP)
 
 // ---------- Thermistor ----------
-const float SERIES_RESISTOR     = 4300.0;
+const float SERIES_RESISTOR     = 989.9;  // 1k pull-up (measured)
 const float NOMINAL_RESISTANCE  = 100000.0;
 const float NOMINAL_TEMPERATURE = 25.0;
 const float BETA_COEFFICIENT    = 3950.0;
@@ -26,12 +26,19 @@ const float OVERTEMP_CUTOFF = 320.0;  // hard safety cutoff
 const int   PWM_MAX = 255;
 const unsigned long PID_INTERVAL = 250; // ms between PID computations
 
+// Safety / auto-cycle (manual process -- never leave it running unattended)
+const unsigned long HEATING_MAX = 300000UL; // 5 min: auto-cycle HEATING -> COOLING
+const unsigned long COOLING_MAX = 300000UL; // 5 min: auto-cycle COOLING -> IDLE
+const float TEMP_MIN_VALID = 5.0;           // below this => thermistor open/disconnected
+
 // ---------- PID gains ----------
-// Auto-tuned (relay method) for this hotend: Ku=60.59, Tu=17.02s -> Ziegler-Nichols.
-// Re-run 'a' to retune if the hardware changes. 'p'/'i'/'d' adjust live.
-float Kp = 36.354;
-float Ki = 4.2715;
-float Kd = 77.349;
+// Derived from the trustworthy first auto-tune (Ku=60.59, Tu=17.02s) using
+// Tyreus-Luyben tuning -> stable, low-overshoot hold (gentler than Ziegler-Nichols).
+//   Kp = Ku/3.2,  Ki = Kp/(2.2*Tu),  Kd = Kp*(Tu/6.3)
+// 'p'/'i'/'d' adjust live; re-run 'a' to retune (see note on AT_BAND below).
+float Kp = 18.9;
+float Ki = 0.51;
+float Kd = 51.2;
 
 // PID internal state
 float integral = 0.0;
@@ -146,7 +153,42 @@ void updateCooling() {
   setFan(true);
 }
 
+// Runs every loop, before the state machine. Two jobs:
+//   1) Open-thermistor guard: a disconnected sensor floats the divider and reads
+//      implausibly cold (negative). If that happens, kill the heater -> IDLE.
+//   2) Auto-cycle timeouts: HEATING -> COOLING -> IDLE after 5 min each, so the
+//      rig never sits hot unattended.
+void checkSafety(float temp) {
+  if (temp < TEMP_MIN_VALID) {
+    if (currentState != IDLE) {
+      Serial.println("THERMISTOR FAULT (open?) -> IDLE");
+    }
+    allOff();
+    currentState = IDLE;
+    stateStartTime = millis();
+    return;
+  }
+
+  unsigned long elapsed = millis() - stateStartTime;
+  if (currentState == HEATING && elapsed > HEATING_MAX) {
+    currentState = COOLING;
+    stateStartTime = millis();
+    Serial.println("TIMEOUT: HEATING -> COOLING");
+  } else if (currentState == COOLING && elapsed > COOLING_MAX) {
+    currentState = IDLE;
+    stateStartTime = millis();
+    Serial.println("TIMEOUT: COOLING -> IDLE");
+  }
+}
+
 // ---------- OLED ----------
+// Quick probe (one transaction) so a missing display costs ~1 timeout, not a
+// full multi-page redraw worth of them. Keeps the control loop responsive.
+bool displayPresent() {
+  Wire.beginTransmission(0x3C);
+  return (Wire.endTransmission() == 0);
+}
+
 void drawDisplay(float temp) {
   u8g2.firstPage();
   do {
@@ -163,7 +205,8 @@ void drawDisplay(float temp) {
     u8g2.print(TARGET_TEMP, 0);
     u8g2.setCursor(72, 36);
     u8g2.print("PWM ");
-    u8g2.print(currentState == HEATING ? lastPwm : 0);
+    u8g2.print(currentState == HEATING ? (lastPwm * 100 + 127) / 255 : 0);
+    u8g2.print("%");
 
     // State
     u8g2.setCursor(0, 54);
@@ -182,7 +225,9 @@ void drawDisplay(float temp) {
 void runAutotune() {
   const int   AT_HIGH   = 255;       // relay high output
   const int   AT_LOW    = 0;         // relay low output
-  const float AT_BAND   = 1.0;       // noise band (deg C) around setpoint
+  const float AT_BAND   = 3.0;       // noise band (deg C); must exceed ADC step
+                                     // (~1.3 deg C/count at operating temp) or the
+                                     // relay chatters on quantization noise
   const int   AT_CYCLES = 6;         // oscillation cycles to observe
   const unsigned long AT_TIMEOUT = 600000UL; // 10 min safety
 
@@ -247,18 +292,20 @@ void runAutotune() {
       Serial.print(" switches=");
       Serial.println(switches);
 
-      u8g2.firstPage();
-      do {
-        u8g2.setFont(u8g2_font_6x12_tr);
-        u8g2.setCursor(0, 20);
-        u8g2.print("AUTOTUNE");
-        u8g2.setCursor(0, 38);
-        u8g2.print("T=");
-        u8g2.print(temp, 1);
-        u8g2.setCursor(0, 54);
-        u8g2.print("cycle ");
-        u8g2.print(switches / 2);
-      } while (u8g2.nextPage());
+      if (displayPresent()) {
+        u8g2.firstPage();
+        do {
+          u8g2.setFont(u8g2_font_6x12_tr);
+          u8g2.setCursor(0, 20);
+          u8g2.print("AUTOTUNE");
+          u8g2.setCursor(0, 38);
+          u8g2.print("T=");
+          u8g2.print(temp, 1);
+          u8g2.setCursor(0, 54);
+          u8g2.print("cycle ");
+          u8g2.print(switches / 2);
+        } while (u8g2.nextPage());
+      }
     }
     delay(20);
   }
@@ -381,6 +428,12 @@ void setup() {
   digitalWrite(ledPin, LOW);
   lastButtonState = digitalRead(buttonPin);
 
+  // SAFETY: give I2C a hard timeout so a disconnected/faulty OLED can NEVER hang
+  // loop(). Without this, Wire blocks forever waiting for an ACK -- if that happens
+  // mid-HEATING, the heater stays on and the over-temp cutoff never runs.
+  Wire.begin();
+  Wire.setWireTimeout(25000, true);   // 25 ms timeout, auto-reset the bus
+
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x12_tr);
   u8g2.firstPage();
@@ -402,6 +455,8 @@ void loop() {
 
   float temp = readTemperature();
 
+  checkSafety(temp);
+
   switch (currentState) {
     case IDLE:
       allOff();
@@ -421,7 +476,7 @@ void loop() {
   if (now - lastSerialTime >= 500) {
     lastSerialTime = now;
 
-    drawDisplay(temp);
+    if (displayPresent()) drawDisplay(temp);
 
     Serial.print("ADC: ");
     Serial.print(analogRead(thermistorPin));

@@ -151,7 +151,13 @@ blocking calibration — let it finish. Re-run after changing the setpoint a lot
 
 ## Safety
 
-- Hard over-temperature cutoff at **340°C** (forces IDLE).
-- Thermistor failure detection (ADC clamped to safe range).
+- Hard over-temperature cutoff (forces IDLE) — see `OVERTEMP_CUTOFF`.
+- **Open-thermistor guard:** a disconnected sensor reads implausibly cold
+  (negative); if temp drops below 5°C the heater is killed and state → IDLE.
+- **Auto-cycle timeouts** (manual process — never left running):
+  - HEATING → COOLING after `HEATING_MAX` (5 min).
+  - COOLING → IDLE after `COOLING_MAX` (5 min).
+- **I2C watchdog:** OLED I2C has a 25 ms timeout + presence check, so a
+  disconnected/faulty display can never hang `loop()` and strand the heater on.
 - PID output clamped 0–255; integral anti-windup prevents runaway.
 - Auto-tune has its own overtemp + 10-minute timeout abort.
