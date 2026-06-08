@@ -35,7 +35,7 @@ const int   PWM_MAX = 255;
 const unsigned long PID_INTERVAL = 250; // ms between PID computations
 
 // Safety / auto-cycle (manual process -- never leave it running unattended)
-const unsigned long HEATING_MAX = 300000UL; // 5 min: auto-cycle HEATING -> COOLING
+const unsigned long HEATING_MAX = 150000UL; // 5 min: auto-cycle HEATING -> COOLING
 const float COOL_DONE_TEMP = 110.0;         // COOLING -> IDLE once cooled below this
                                             // (no time backstop: cools until it reaches this)
 const float TEMP_MIN_VALID = -10.0;         // below this => thermistor open/disconnected
