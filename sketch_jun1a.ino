@@ -12,7 +12,9 @@ const int thermistorPin = A1;   // thermistor divider (A0 unused -- was behaving
 const int heaterPin     = 11;   // MOSFET gate -- HARDWARE PWM (moved from D13)
 const int ledPin        = 13;   // heating-status LED (onboard + future external LED)
 const int fanPin        = 12;   // cooling fan MOSFET
-const int buttonPin     = 7;    // momentary button to GND (INPUT_PULLUP)
+const int buttonPin     = 7;    // EC11 push switch (KEY) to GND (INPUT_PULLUP)
+const int encoderPinA   = 2;    // EC11 phase A (S1) -- INT0
+const int encoderPinB   = 3;    // EC11 phase B (S2) -- INT1
 
 // ---------- Thermistor ----------
 const float SERIES_RESISTOR     = 989.9;  // 1k pull-up (measured)
@@ -21,8 +23,14 @@ const float NOMINAL_TEMPERATURE = 25.0;
 const float BETA_COEFFICIENT    = 3950.0;
 
 // ---------- Control parameters ----------
-float TARGET_TEMP = 275.0;            // setpoint, adjustable live over serial ('s<n>')
-const float OVERTEMP_CUTOFF = 320.0;  // hard safety cutoff
+float TARGET_TEMP = 310.0;            // setpoint, adjustable live ('s<n>' or encoder)
+                                      // 310 = measured meld point (sensor likely reads
+                                      // low at this temp -- see calibration note)
+const float OVERTEMP_CUTOFF = 340.0;  // hard safety cutoff
+// Encoder setpoint clamp. Max tracks 5C below the cutoff so a spin can't push the
+// setpoint into the cutoff. Serial 's' stays unclamped (trusted sweep tool).
+const float SETPOINT_MIN = 0.0;
+const float SETPOINT_MAX = OVERTEMP_CUTOFF - 5.0;
 const int   PWM_MAX = 255;
 const unsigned long PID_INTERVAL = 250; // ms between PID computations
 
@@ -415,6 +423,38 @@ void handleSerial() {
   }
 }
 
+// ---------- Rotary encoder (EC11) ----------
+// One count per detent. At a detent both phases rest HIGH; the ISR fires on A's
+// falling edge and reads B for direction. A short time-guard rejects contact
+// bounce. If your knob feels reversed, swap S1/S2 (or flip the +/-).
+volatile long encoderDelta = 0;
+
+void encoderISR() {
+  static unsigned long lastInt = 0;
+  unsigned long now = millis();          // readable in an ISR (just doesn't advance)
+  if (now - lastInt < 2) return;         // debounce bounce
+  lastInt = now;
+  if (digitalRead(encoderPinB)) encoderDelta++;
+  else                          encoderDelta--;
+}
+
+// Apply accumulated detents to the setpoint -- only while HEATING (per design).
+// We always drain the counter so turns made in IDLE/COOLING don't pile up and
+// jump the setpoint the moment HEATING starts. 1C per detent, clamped.
+void handleEncoder() {
+  if (encoderDelta == 0) return;
+  noInterrupts();
+  long d = encoderDelta;
+  encoderDelta = 0;
+  interrupts();
+
+  if (currentState == HEATING) {
+    TARGET_TEMP = constrain(TARGET_TEMP + (float)d, SETPOINT_MIN, SETPOINT_MAX);
+    Serial.print("SETPOINT (encoder) = ");
+    Serial.println(TARGET_TEMP, 0);
+  }
+}
+
 void handleButton() {
   bool reading = digitalRead(buttonPin);
 
@@ -460,6 +500,9 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   pinMode(fanPin, OUTPUT);
   pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), encoderISR, FALLING);
 
   allOff();
   digitalWrite(ledPin, LOW);
@@ -488,6 +531,7 @@ void setup() {
 
 void loop() {
   handleButton();
+  handleEncoder();
   handleSerial();
 
   float temp = readTemperature();
