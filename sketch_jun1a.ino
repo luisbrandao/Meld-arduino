@@ -28,8 +28,8 @@ const unsigned long PID_INTERVAL = 250; // ms between PID computations
 
 // Safety / auto-cycle (manual process -- never leave it running unattended)
 const unsigned long HEATING_MAX = 300000UL; // 5 min: auto-cycle HEATING -> COOLING
-const unsigned long COOLING_MAX = 300000UL; // 5 min: auto-cycle COOLING -> IDLE (backstop)
-const float COOL_DONE_TEMP = 45.0;          // COOLING -> IDLE once cooled below this
+const float COOL_DONE_TEMP = 110.0;         // COOLING -> IDLE once cooled below this
+                                            // (no time backstop: cools until it reaches this)
 const float TEMP_MIN_VALID = -10.0;         // below this => thermistor open/disconnected
                                             // (open reads ~-19C; -10 clears room-temp noise)
 const int   FAULT_DEBOUNCE = 3;             // consecutive bad reads before faulting
@@ -172,8 +172,8 @@ void updateCooling() {
 // Runs every loop, before the state machine. Two jobs:
 //   1) Open-thermistor guard: a disconnected sensor floats the divider and reads
 //      implausibly cold (negative). If that happens, kill the heater -> IDLE.
-//   2) Auto-cycle timeouts: HEATING -> COOLING -> IDLE after 5 min each, so the
-//      rig never sits hot unattended.
+//   2) Auto-cycle: HEATING -> COOLING after 5 min (so the rig never sits hot
+//      unattended); COOLING -> IDLE once cooled below COOL_DONE_TEMP.
 void checkSafety(float temp) {
   // Debounce: require several consecutive implausible reads so a single ADC glitch
   // near the rail (room temp is close to the open-circuit value at 1k) can't trip it.
@@ -196,14 +196,10 @@ void checkSafety(float temp) {
     currentState = COOLING;
     stateStartTime = millis();
     Serial.println("TIMEOUT: HEATING -> COOLING");
-  } else if (currentState == COOLING && (temp < COOL_DONE_TEMP || elapsed > COOLING_MAX)) {
+  } else if (currentState == COOLING && temp < COOL_DONE_TEMP) {
     currentState = IDLE;
     stateStartTime = millis();
-    if (temp < COOL_DONE_TEMP) {
-      Serial.println("COOLED (<45C): COOLING -> IDLE");
-    } else {
-      Serial.println("TIMEOUT: COOLING -> IDLE");
-    }
+    Serial.println("COOLED (<110C): COOLING -> IDLE");
   }
 }
 
@@ -241,6 +237,21 @@ void drawDisplay(float temp) {
       case IDLE:    u8g2.print("IDLE"); break;
       case HEATING: u8g2.print("HEATING"); break;
       case COOLING: u8g2.print("COOLING"); break;
+    }
+
+    // HEATING: seconds left on the checkSafety() timeout that bumps to COOLING.
+    // COOLING has no timer -- it runs until temp < COOL_DONE_TEMP -- so show the
+    // cool-down target instead.
+    if (currentState == HEATING) {
+      unsigned long elapsed = millis() - stateStartTime;
+      long remain = (elapsed >= HEATING_MAX) ? 0 : (long)((HEATING_MAX - elapsed) / 1000UL);
+      u8g2.setCursor(98, 54);
+      u8g2.print(remain);
+      u8g2.print("s");
+    } else if (currentState == COOLING) {
+      u8g2.setCursor(92, 54);
+      u8g2.print(">");
+      u8g2.print(COOL_DONE_TEMP, 0);
     }
   } while (u8g2.nextPage());
 }
