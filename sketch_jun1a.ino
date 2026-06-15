@@ -432,7 +432,7 @@ volatile long encoderDelta = 0;
 void encoderISR() {
   static unsigned long lastInt = 0;
   unsigned long now = millis();          // readable in an ISR (just doesn't advance)
-  if (now - lastInt < 2) return;         // debounce bounce
+  if (now - lastInt < 15) return;        // debounce: mechanical switches need 5-20ms
   lastInt = now;
   if (digitalRead(encoderPinB)) encoderDelta++;
   else                          encoderDelta--;
@@ -578,5 +578,5 @@ void loop() {
     Serial.println();
   }
 
-  delay(50);
+  delay(10);
 }
